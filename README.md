@@ -28,6 +28,17 @@ Optional native vector index:
 pip install sqlite-vec
 ```
 
+## Collaboration
+
+Recommended default workflow for ongoing changes:
+
+1. create a branch from `main`
+2. make one focused change
+3. open a pull request into `main`
+4. merge after CI passes
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the branch naming convention and a sample PR flow.
+
 ## .env
 
 Place `.env` in `D:\dev\ResearchAgent`:
