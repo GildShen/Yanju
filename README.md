@@ -1,4 +1,4 @@
-﻿# Research Agent MVP
+# Research Agent MVP
 
 This project implements a local-first research agent for:
 
@@ -336,5 +336,4 @@ Behavior:
 - you select one date from the dropdown
 - the list shows only papers for that date
 - star toggling still works inside the filtered date view
-#   Y a n j u  
- 
+#
