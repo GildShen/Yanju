@@ -336,4 +336,3 @@ Behavior:
 - you select one date from the dropdown
 - the list shows only papers for that date
 - star toggling still works inside the filtered date view
-#
