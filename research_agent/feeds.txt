@@ -1,0 +1,11 @@
+# MIS Quarterly
+https://aisel.aisnet.org/misq/recent.rss
+
+# Information Systems Research (INFORMS)
+https://pubsonline.informs.org/action/showFeed?type=etoc&feed=rss&jc=isre
+
+# Decision Support Systems (Elsevier)
+http://rss.sciencedirect.com/publication/science/01679236
+
+# General AI/CS from arXiv
+https://arxiv.org/rss/cs.AI

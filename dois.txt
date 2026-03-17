@@ -1,0 +1,6 @@
+# Decision Support Systems paper
+10.1016/j.dss.2023.114115
+# Information Systems Research
+10.1287/isre.2022.1179
+# Nature Human Behaviour (AI related)
+10.1038/s41562-023-01648-z
