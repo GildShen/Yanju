@@ -88,6 +88,7 @@ class TodaySummaryRequest(BaseModel):
     limit: int = 15
     target_date: str | None = None
     force_refresh: bool = False
+    starred_only: bool = False
 
 
 class ResearchTopicRequest(BaseModel):
@@ -146,18 +147,39 @@ class AnalyzeUploadRequest(BaseModel):
     force: bool = True
     model: str = DEFAULT_ANSWER_MODEL
 
-TAIPEI_TZ = timezone(timedelta(hours=8))
-LANGUAGE_LABELS = {
-    "zh-TW": "Traditional Chinese",
-    "en": "English",
-}
-SUMMARY_FILTER_EMBEDDING_MODEL = DEFAULT_EMBEDDING_MODEL
-SUMMARY_PROMPT_VERSION = "v13-summary-abstract-filter-and-i18n"
-
-EMPTY_MESSAGES = {
-    "zh-TW": "\u4eca\u5929\u9084\u6c92\u6709\u65b0\u532f\u5165\u7684 paper\u3002\u8acb\u5148\u57f7\u884c ingest\uff0c\u518d\u91cd\u65b0\u6574\u7406\u9019\u500b\u6458\u8981\u6b04\u4f4d\u3002",
-    "en": "No new papers were added today. Run ingest first, then refresh this summary.",
-}
+from .summary import (
+    TAIPEI_TZ,
+    LANGUAGE_LABELS,
+    SUMMARY_FILTER_EMBEDDING_MODEL,
+    SUMMARY_PROMPT_VERSION,
+    EMPTY_MESSAGES,
+    RESEARCH_TOPIC_KEY,
+    SummaryRequest,
+    get_research_topic as _get_research_topic,
+    set_research_topic as _set_research_topic,
+    ensure_summary_embeddings as _ensure_summary_embeddings,
+    resolve_target_date as _resolve_target_date,
+    papers_for_date as _papers_for_date,
+    cosine_similarity as _cosine_similarity,
+    select_summary_papers as _select_summary_papers,
+    encode_summary_cache as _encode_summary_cache,
+    read_summary_cache as _read_summary_cache,
+    summary_cache_path as _summary_cache_path,
+    summary_eligible_items as _summary_eligible_items,
+    summary_empty_message as _summary_empty_message,
+    build_daily_summary_prompt as _build_daily_summary_prompt,
+    build_summary_rewrite_prompt as _build_summary_rewrite_prompt,
+    sse_event as _sse_event,
+    cached_summary_response as _cached_summary_response,
+    resolve_summary_selection as _resolve_summary_selection,
+    generate_summary_from_selection as _generate_today_summary_from_selection_impl,
+    stream_summary as _stream_today_summary_impl,
+    generate_summary as _generate_today_summary_impl,
+    ensure_daily_ready as _ensure_today_ready_impl,
+    preview_summary_selection_rewrite as _preview_summary_selection_rewrite_impl,
+    apply_summary_selection_rewrite as _apply_summary_selection_rewrite_impl,
+    save_summary_text as _save_summary_text_impl,
+)
 
 
 
@@ -667,10 +689,11 @@ APP_HTML = r"""<!DOCTYPE html>
               <button class="ghost" onclick="loadTodaySummary(true)" data-i18n="regenerate">Regenerate</button>
             </div>
           </div>
-          <div class="meta-chip-row">
-            <span class="meta-chip">Narrative summary</span>
-            <span class="meta-chip">Semantic topic filter</span>
-            <span class="meta-chip">Date-based cache</span>
+          <div class="meta-chip-row align-center">
+            <label class="toggle-control">
+              <input type="checkbox" id="summaryStarredOnly" onchange="loadTodaySummary(true)">
+              <span class="control-label" data-i18n="summarize_starred_only">Summarize starred papers only (-B)</span>
+            </label>
           </div>
           <div class="topic-row">
             <input id="researchTopic" data-i18n-placeholder="research_topic_placeholder" placeholder="Set your research topic, e.g. human-AI collaboration in knowledge management">
@@ -1765,7 +1788,8 @@ APP_HTML = r"""<!DOCTYPE html>
     async function loadTodaySummary(forceRefresh) {
       const language = document.getElementById('summaryLanguage').value;
       const targetDate = document.getElementById('summaryDate').value || new Date().toISOString().slice(0, 10);
-      const payload = { language, model: document.getElementById('answerModel').value || 'gpt-5-mini', limit: 15, target_date: targetDate, force_refresh: !!forceRefresh };
+      const starredOnly = document.getElementById('summaryStarredOnly') ? document.getElementById('summaryStarredOnly').checked : false;
+      const payload = { language, model: document.getElementById('answerModel').value || 'gpt-5-mini', limit: 15, target_date: targetDate, force_refresh: !!forceRefresh, starred_only: starredOnly };
       currentSummaryText = '';
       clearSummarySelection(forceRefresh ? t('regenerating_summary') : t('loading_summary'));
       document.getElementById('todaySummaryOutput').textContent = forceRefresh ? t('regenerating_summary') : t('loading_summary');
@@ -1807,6 +1831,7 @@ APP_HTML = r"""<!DOCTYPE html>
     async function ensureDailyReady() {
       const language = document.getElementById('summaryLanguage').value;
       const targetDate = document.getElementById('summaryDate').value || new Date().toISOString().slice(0, 10);
+      const starredOnly = document.getElementById('summaryStarredOnly') ? document.getElementById('summaryStarredOnly').checked : false;
       currentSummaryText = '';
       clearSummarySelection(t('checking_summary'));
       document.getElementById('todaySummaryOutput').textContent = t('checking_summary');
@@ -1814,7 +1839,7 @@ APP_HTML = r"""<!DOCTYPE html>
       try {
         const data = await api('/api/actions/ensure-daily-ready', {
           method: 'POST',
-          body: JSON.stringify({ language, model: document.getElementById('answerModel').value || 'gpt-5-mini', limit: 15, target_date: targetDate, force_refresh: false }),
+          body: JSON.stringify({ language, model: document.getElementById('answerModel').value || 'gpt-5-mini', limit: 15, target_date: targetDate, force_refresh: false, starred_only: starredOnly }),
         });
         renderTodaySummary(data);
         if ((data.imported_count || 0) > 0 || (Array.isArray(data.actions) && data.actions.includes('ingest'))) {
@@ -2046,7 +2071,7 @@ def make_config() -> AppConfig:
     return AppConfig(feeds_path=root / "feeds.txt", data_dir=root / "data", vault_dir=root / "vault")
 
 
-RESEARCH_TOPIC_KEY = "research_topic"
+RESEARCH_TOPIC_KEY = RESEARCH_TOPIC_KEY  # re-export for backward compat
 
 
 def _attach_analysis_note_metadata(config: AppConfig, data: dict[str, object]) -> dict[str, object]:
@@ -2071,568 +2096,118 @@ def _attach_analysis_note_metadata(config: AppConfig, data: dict[str, object]) -
     return record
 
 
-def _get_research_topic(config: AppConfig) -> str:
-    with get_connection(config) as connection:
-        initialize_database(connection)
-        return (get_setting(connection, RESEARCH_TOPIC_KEY) or "").strip()
-
-
-def _set_research_topic(config: AppConfig, topic: str) -> str:
-    cleaned = " ".join(topic.split()).strip()
-    with get_connection(config) as connection:
-        initialize_database(connection)
-        set_setting(connection, RESEARCH_TOPIC_KEY, cleaned)
-    return cleaned
-
-
-def _ensure_summary_embeddings(config: AppConfig, papers: list[dict[str, object]], model: str = SUMMARY_FILTER_EMBEDDING_MODEL) -> None:
-    entry_ids = [str(item.get("entry_id")) for item in papers if item.get("entry_id")]
-    if not entry_ids:
-        return
-    with get_connection(config) as connection:
-        initialize_database(connection)
-        existing = fetch_embeddings_for_entries(connection, entry_ids, model)
-        missing_ids = [entry_id for entry_id in entry_ids if entry_id not in existing]
-        missing_papers = [paper for paper in papers if str(paper.get("entry_id")) in missing_ids]
-    if not missing_papers:
-        return
-    _embed_paper_records(config, missing_papers, model=model, dimensions=None, init_vec=False)
-
-
-@lru_cache(maxsize=64)
-def _cached_topic_embedding(topic: str, model: str) -> tuple[float, ...]:
-    return tuple(OpenAIEmbeddingClient().create_embeddings([topic], model=model).embeddings[0])
-
-
-def _resolve_target_date(target_date: str | None) -> str:
-    if not target_date:
-        return datetime.now(TAIPEI_TZ).date().isoformat()
-    try:
-        return date.fromisoformat(target_date).isoformat()
-    except ValueError as exc:
-        raise ValueError(f"Invalid target date: {target_date}") from exc
-
-
-
-def _papers_for_date(config: AppConfig, target_date: str, limit: int) -> list[dict[str, object]]:
-    resolved_date = _resolve_target_date(target_date)
-    with get_connection(config) as connection:
-        initialize_database(connection)
-        return list_papers(connection, limit=limit, published=resolved_date)
-
-
-
-def _select_summary_papers(config: AppConfig, target_date: str, limit: int) -> tuple[list[dict[str, object]], str, str]:
-    daily_items = _papers_for_date(config, target_date, 200)
-    topic = _get_research_topic(config)
-    if not topic:
-        return daily_items[:limit], "latest", topic
-
-    _ensure_summary_embeddings(config, daily_items, SUMMARY_FILTER_EMBEDDING_MODEL)
-    topic_embedding = list(_cached_topic_embedding(topic, SUMMARY_FILTER_EMBEDDING_MODEL))
-    entry_ids = [str(item.get("entry_id")) for item in daily_items if item.get("entry_id")]
-    with get_connection(config) as connection:
-        initialize_database(connection)
-        embeddings = fetch_embeddings_for_entries(connection, entry_ids, SUMMARY_FILTER_EMBEDDING_MODEL)
-
-    scored: list[dict[str, object]] = []
-    for item in daily_items:
-        entry_id = str(item.get("entry_id") or "")
-        embedding = embeddings.get(entry_id)
-        if not embedding:
-            continue
-        score = _cosine_similarity(topic_embedding, embedding)
-        ranked = dict(item)
-        ranked["relevance_score"] = score
-        scored.append(ranked)
-
-    scored.sort(key=lambda item: float(item.get("relevance_score", -999.0)), reverse=True)
-    if scored:
-        return scored[:limit], "topic", topic
-    return daily_items[:limit], "latest", topic
-
-
-def _cosine_similarity(left: list[float], right: list[float]) -> float:
-    if len(left) != len(right):
-        return -1.0
-    left_norm = sum(value * value for value in left) ** 0.5
-    right_norm = sum(value * value for value in right) ** 0.5
-    if left_norm == 0 or right_norm == 0:
-        return -1.0
-    return sum(l * r for l, r in zip(left, right)) / (left_norm * right_norm)
-
-
-def _encode_summary_cache(summary: str, topic: str) -> str:
-    topic_line = topic.replace("\n", " ").strip()
-    header = f"<!-- topic: {topic_line} | prompt_version: {SUMMARY_PROMPT_VERSION} -->"
-    return f"{header}\n\n{summary}"
-
-
-def _read_summary_cache(cache_path: Path) -> tuple[str, str, str]:
-    raw = cache_path.read_text(encoding="utf-8")
-    first_line, _, remainder = raw.partition("\n")
-    if first_line.startswith("<!-- ") and first_line.endswith(" -->"):
-        metadata = first_line[len("<!-- ") : -len(" -->")]
-        parts = [part.strip() for part in metadata.split("|")]
-        values: dict[str, str] = {}
-        for part in parts:
-            key, sep, value = part.partition(":")
-            if sep:
-                values[key.strip()] = value.strip()
-        summary = remainder.lstrip("\n")
-        return values.get("topic", ""), summary, values.get("prompt_version", "")
-    return "", raw, ""
-
-
-def _summary_cache_path(config: AppConfig, language: str, day_label: str) -> Path:
-    safe_language = language.replace("/", "-").replace("\\", "-")
-    target_dir = config.data_dir / "daily-summaries" / safe_language
-    target_dir.mkdir(parents=True, exist_ok=True)
-    return target_dir / f"{day_label}.md"
-
-
-def _summary_eligible_items(items: list[dict[str, object]]) -> list[dict[str, object]]:
-    return [item for item in items if str(item.get("abstract") or "").strip()]
-
-
-def _summary_empty_message(language: str, *, had_items_without_abstract: bool) -> str:
-    if had_items_without_abstract:
-        if language == "zh-TW":
-            return "今天選到的 paper 缺少可用摘要，因此本次摘要已略過這些文獻。若需要納入，請先補 abstract 或改用全文抽取流程。"
-        return "The selected papers for this date do not have usable abstracts, so they were skipped from the summary. Add abstracts or use the full-text extraction flow first."
-    return EMPTY_MESSAGES.get(language, EMPTY_MESSAGES["en"])
-
-
-def _build_daily_summary_prompt(items: list[dict[str, object]], *, language: str, day_label: str, topic: str) -> str:
-    language_label = LANGUAGE_LABELS.get(language, language)
-    papers_block: list[str] = []
-    for index, item in enumerate(items, start=1):
-        authors = ", ".join(item.get("authors", [])) if isinstance(item.get("authors"), list) else ""
-        papers_block.append(
-            "\n".join(
-                [
-                    f"Title: {item.get('title', '')}",
-                    f"Authors: {authors}",
-                    f"Source: {item.get('source', '')}",
-                    f"Published: {item.get('published', '')}",
-                    f"Paper URL: {item.get('link', '')}",
-                    f"PDF URL: {item.get('pdf_url', '')}",
-                    f"Abstract: {item.get('abstract', '')}",
-                ]
-            )
-        )
-    joined_papers = "\n\n".join(papers_block)
-    topic_instruction = (
-        f"Research topic: {topic}. Prioritize relevance to this topic and mention the topic explicitly in the notes."
-        if topic
-        else "No research topic is set. Summarize the latest papers of the day as research notes."
+def _to_summary_request(request: TodaySummaryRequest) -> SummaryRequest:
+    return SummaryRequest(
+        language=request.language,
+        model=request.model,
+        limit=request.limit,
+        target_date=request.target_date,
+        force_refresh=request.force_refresh,
+        starred_only=request.starred_only,
     )
-    return f"""You are writing a research notes entry for a scholar.
-Write the answer in {language_label}.
-Date: {day_label}.
-Use only the provided papers.
-Do not invent findings not supported by titles or abstracts.
-If a paper has no abstract, skip it entirely. Do not infer, reconstruct, or fabricate its problem, method, findings, or contribution.
-Only discuss papers that include a non-empty abstract in the provided input.
-{topic_instruction}
-
-Target style: research notes.
-- Write like a researcher organizing today's reading notes for later thinking and possible study design.
-- Start from a self-reflection (or murmuration) that makes this set of papers worth paying attention to.
-- Mention that you recently read some related papers and specify the source of papers. Specify the number of papers.
-- When discussing each paper, include the research problem, method, and main finding, but keep the prose flowing naturally.
-- Keep the tone rational, clear, and analytical, but not overly formal.
-- You may include a small amount of natural commentary, for example: this is interesting, to some extent, simply put.
-- After introducing several papers, synthesize them into a cross-paper observation.
-- Include concept-level contrasts when useful, such as strong coordination but weak impact, or clear structure but limited evolution.
-- End from a researcher perspective with an open reflection: what kind of study could be designed next, what mechanism is still unclear, or what this phenomenon may imply.
-
-Formatting rules:
-- Do not output internal record markers such as [Paper 1], [Paper 2], Record 1, or similar references.
-- Do not append bracketed paper ids or index labels anywhere in the notes.
-- The main body must be written in connected paragraphs, like a notebook entry.
-- If you mention an individual paper, identify it by title in natural prose, not by index.
-- Avoid generic AI writing habits: do not use empty framing such as "it is worth noting", "overall", "in conclusion", "delves into", "highlights the importance of", or similar stock phrases unless they add concrete meaning.
-- Avoid repetitive sentence templates, abstract filler, and over-smoothed transitions.
-- Prefer specific observations, concrete contrasts, and researcher-like phrasing over polished assistant-style exposition.
-- Write like someone actually keeping research notes, not like a chatbot summarizing content for a general audience.
-- Do not start with heading-like labels or framing phrases such as "Current phenomenon", "Key concern", "Background", "Overview", or similar label-style openers. Start directly with natural prose.
-- Avoid first-person narration. Do not use "I", "we", or the Chinese first-person form "?" unless absolutely unavoidable.
-- Avoid semi-academic stock phrasing such as "this study", "the discussion above", "in summary", or similar formulaic transitions unless they are truly necessary.
-- After the main body, add a separate section titled `References`.
-- In `References`, you must list the papers you used with explicit numbering.
-- Each reference line must include: number, title, authors, source, and URL.
-- Prefer the Paper URL; if missing, use the PDF URL; if both are missing, write `URL: N/A`.
-- The tone of the summary should be natural and conversational, not academic or formal.
-
-Suggested note flow:
-- Paragraph 1: why this cluster of papers matters now, and what thread connects them. Begin with a short random murmuration of the papers.
-- Paragraphs 2-4: discuss representative papers as notes, each with problem, method, and finding.
-- Paragraph 5: synthesize patterns, contrast concepts, and end with a research-facing question or design idea.
-- Final section: `References` only limited to the papers used in this summary.
-- Format each reference exactly like this:
-  1. Title: <title> | Authors: <authors> | Source: <source> | URL: <url>
-Papers for the selected date:
-
-{joined_papers}
-"""
 
 
-def _sse_event(event: str, payload: dict[str, object]) -> str:
-    return f"event: {event}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
+def _generate_today_summary_from_selection(config: AppConfig, request: TodaySummaryRequest, *, target_date: str, items: list[dict[str, object]], selection_mode: str, topic: str) -> dict[str, object]:
+    return _generate_today_summary_from_selection_impl(config, _to_summary_request(request), target_date=target_date, items=items, selection_mode=selection_mode, topic=topic)
 
 
-
-def _build_summary_rewrite_prompt(*, language: str, day_label: str, topic: str, full_summary: str, selected_text: str, instruction: str, prefix: str, suffix: str) -> str:
-    language_label = LANGUAGE_LABELS.get(language, language)
-    topic_line = topic if topic else "No research topic is set."
-    return f"""You are revising a selected passage inside an existing research-notes style daily summary.
-Write the answer in {language_label}.
-Date: {day_label}.
-Research topic: {topic_line}
-
-Task:
-- Rewrite only the selected passage.
-- Follow the user's instruction exactly.
-- Keep the revised passage consistent with the surrounding context.
-- Preserve the same language as the selected passage unless the instruction explicitly asks to change it.
-- Do not rewrite anything outside the selected passage.
-- Do not add headings, labels, markdown fences, commentary, or explanations.
-- Return only the replacement text for the selected passage.
-
-User instruction:
-{instruction}
-
-Full summary:
-{full_summary}
-
-Context before selection:
-{prefix}
-
-Selected passage to rewrite:
-{selected_text}
-
-Context after selection:
-{suffix}
-"""
+def _stream_today_summary(config: AppConfig, request: TodaySummaryRequest):
+    yield from _stream_today_summary_impl(config, _to_summary_request(request))
 
 
-def _resolve_summary_selection(summary_text: str, start_offset: int, end_offset: int, selected_text: str) -> tuple[int, int, str]:
-    if start_offset < 0 or end_offset < start_offset:
-        raise ValueError("Invalid selection range.")
-    if end_offset > len(summary_text):
-        raise ValueError("Selection range exceeds summary length.")
+def _generate_today_summary(config: AppConfig, request: TodaySummaryRequest) -> dict[str, object]:
+    return _generate_today_summary_impl(config, _to_summary_request(request))
 
-    selected_from_offsets = summary_text[start_offset:end_offset]
-    if selected_from_offsets == selected_text:
-        return start_offset, end_offset, selected_from_offsets
 
-    snippet_index = summary_text.find(selected_text)
-    if snippet_index < 0:
-        raise ValueError("The selected text no longer matches the current summary.")
-    return snippet_index, snippet_index + len(selected_text), selected_text
-
+def _ensure_today_ready(config: AppConfig, request: TodaySummaryRequest) -> dict[str, object]:
+    return _ensure_today_ready_impl(config, _to_summary_request(request))
 
 
 def _preview_summary_selection_rewrite(config: AppConfig, request: SummaryRewriteRequest) -> dict[str, object]:
     target_date = _resolve_target_date(request.target_date)
-    summary_text = request.summary_text or ""
-    start_offset, end_offset, selected_text = _resolve_summary_selection(
-        summary_text,
-        request.start_offset,
-        request.end_offset,
-        request.selected_text,
-    )
-
-    instruction = request.instruction.strip()
-    if not instruction:
-        raise ValueError("Rewrite instruction is required.")
-
-    prefix = summary_text[max(0, start_offset - 1200):start_offset]
-    suffix = summary_text[end_offset:min(len(summary_text), end_offset + 1200)]
-    topic = _get_research_topic(config)
-    prompt = _build_summary_rewrite_prompt(
+    return _preview_summary_selection_rewrite_impl(
+        config,
         language=request.language,
-        day_label=target_date,
-        topic=topic,
-        full_summary=summary_text,
-        selected_text=selected_text,
-        instruction=instruction,
-        prefix=prefix,
-        suffix=suffix,
+        model=request.model,
+        target_date=request.target_date,
+        summary_text=request.summary_text,
+        start_offset=request.start_offset,
+        end_offset=request.end_offset,
+        selected_text=request.selected_text,
+        instruction=request.instruction,
     )
-    rewritten_text = OpenAIAnswerClient().create_answer(prompt=prompt, model=request.model).text.strip()
-    if not rewritten_text:
-        raise ValueError("The model returned an empty rewrite.")
-
-    return {
-        "date": target_date,
-        "language": request.language,
-        "topic": topic,
-        "selected_text": selected_text,
-        "rewritten_text": rewritten_text,
-        "start_offset": start_offset,
-        "end_offset": end_offset,
-    }
-
 
 
 def _apply_summary_selection_rewrite(config: AppConfig, request: SummaryRewriteApplyRequest) -> dict[str, object]:
-    target_date = _resolve_target_date(request.target_date)
-    summary_text = request.summary_text or ""
-    start_offset, end_offset, _ = _resolve_summary_selection(
-        summary_text,
-        request.start_offset,
-        request.end_offset,
-        request.selected_text,
+    return _apply_summary_selection_rewrite_impl(
+        config,
+        language=request.language,
+        target_date=request.target_date,
+        summary_text=request.summary_text,
+        start_offset=request.start_offset,
+        end_offset=request.end_offset,
+        selected_text=request.selected_text,
+        rewritten_text=request.rewritten_text,
     )
-    rewritten_text = request.rewritten_text.strip()
-    if not rewritten_text:
-        raise ValueError("Rewritten text is required.")
-
-    topic = _get_research_topic(config)
-    updated_summary = summary_text[:start_offset] + rewritten_text + summary_text[end_offset:]
-    cache_path = _summary_cache_path(config, request.language, target_date)
-    cache_path.write_text(_encode_summary_cache(updated_summary, topic), encoding="utf-8")
-    return {
-        "date": target_date,
-        "language": request.language,
-        "topic": topic,
-        "summary": updated_summary,
-        "rewritten_text": rewritten_text,
-        "path": str(cache_path),
-    }
 
 
 def _save_summary_text(config: AppConfig, request: SummarySaveRequest) -> dict[str, object]:
-    target_date = _resolve_target_date(request.target_date)
-    summary_text = (request.summary_text or "").strip()
-    if not summary_text:
-        raise ValueError("Summary text is required.")
-    items, _, topic = _select_summary_papers(config, target_date, 15)
-    cache_path = _summary_cache_path(config, request.language, target_date)
-    cache_path.write_text(_encode_summary_cache(summary_text, topic), encoding="utf-8")
-    paper_count = len(items)
-    return {
-        "date": target_date,
-        "language": request.language,
-        "topic": topic,
-        "summary": summary_text,
-        "path": str(cache_path),
-        "paper_count": paper_count,
-        "cached": False,
-        "selection_mode": "manual-edit",
-    }
-
-
-def _cached_summary_response(*, request: TodaySummaryRequest, target_date: str, items: list[dict[str, object]], selection_mode: str, topic: str, cache_path: Path) -> dict[str, object] | None:
-    if cache_path.exists() and not request.force_refresh:
-        cached_topic, cached_summary, cached_prompt_version = _read_summary_cache(cache_path)
-        if cached_topic == topic and cached_prompt_version == SUMMARY_PROMPT_VERSION:
-            return {
-                "date": target_date,
-                "language": request.language,
-                "paper_count": len(items),
-                "summary": cached_summary,
-                "papers": [
-                    {
-                        "entry_id": item.get("entry_id"),
-                        "title": item.get("title"),
-                        "source": item.get("source"),
-                        "published": item.get("published"),
-                        "doi": item.get("doi"),
-                    }
-                    for item in items
-                ],
-                "cached": True,
-                "path": str(cache_path),
-                "selection_mode": selection_mode,
-                "topic": topic,
-            }
-    return None
-
-
-def _generate_today_summary_from_selection(config: AppConfig, request: TodaySummaryRequest, *, target_date: str, items: list[dict[str, object]], selection_mode: str, topic: str) -> dict[str, object]:
-    cache_path = _summary_cache_path(config, request.language, target_date)
-    cached_response = _cached_summary_response(
-        request=request,
-        target_date=target_date,
-        items=items,
-        selection_mode=selection_mode,
-        topic=topic,
-        cache_path=cache_path,
-    )
-    if cached_response is not None:
-        return cached_response
-
-    enriched_items = enrich_missing_abstracts(config, items)
-    summary_items = _summary_eligible_items(enriched_items)
-
-    if not summary_items:
-        summary = _summary_empty_message(request.language, had_items_without_abstract=bool(enriched_items))
-        cache_path.write_text(_encode_summary_cache(summary, topic), encoding="utf-8")
-        return {
-            "date": target_date,
-            "language": request.language,
-            "paper_count": 0,
-            "summary": summary,
-            "papers": [],
-            "cached": False,
-            "path": str(cache_path),
-            "selection_mode": selection_mode,
-            "topic": topic,
-        }
-
-    prompt = _build_daily_summary_prompt(summary_items, language=request.language, day_label=target_date, topic=topic)
-    summary = OpenAIAnswerClient().create_answer(prompt=prompt, model=request.model).text
-    cache_path.write_text(_encode_summary_cache(summary, topic), encoding="utf-8")
-    return {
-        "date": target_date,
-        "language": request.language,
-        "paper_count": len(summary_items),
-        "summary": summary,
-        "papers": [
-            {
-                "entry_id": item.get("entry_id"),
-                "title": item.get("title"),
-                "source": item.get("source"),
-                "published": item.get("published"),
-                "doi": item.get("doi"),
-            }
-            for item in summary_items
-        ],
-        "cached": False,
-        "path": str(cache_path),
-        "selection_mode": selection_mode,
-        "topic": topic,
-    }
-
-
-def _stream_today_summary(config: AppConfig, request: TodaySummaryRequest):
-    target_date = _resolve_target_date(request.target_date)
-    items, selection_mode, topic = _select_summary_papers(config, target_date, request.limit)
-    cache_path = _summary_cache_path(config, request.language, target_date)
-
-    cached_response = _cached_summary_response(
-        request=request,
-        target_date=target_date,
-        items=items,
-        selection_mode=selection_mode,
-        topic=topic,
-        cache_path=cache_path,
-    )
-    if cached_response is not None:
-        meta = {k: cached_response[k] for k in ["date", "language", "paper_count", "selection_mode", "topic", "path"]}
-        yield _sse_event("meta", {**meta, "cached": True})
-        yield _sse_event("delta", {"text": str(cached_response["summary"])})
-        yield _sse_event("done", {**meta, "cached": True})
-        return
-
-    enriched_items = enrich_missing_abstracts(config, items)
-    summary_items = _summary_eligible_items(enriched_items)
-    meta = {
-        "date": target_date,
-        "language": request.language,
-        "paper_count": len(summary_items),
-        "selection_mode": selection_mode,
-        "topic": topic,
-        "path": str(cache_path),
-    }
-
-    if not summary_items:
-        summary = _summary_empty_message(request.language, had_items_without_abstract=bool(enriched_items))
-        cache_path.write_text(_encode_summary_cache(summary, topic), encoding="utf-8")
-        yield _sse_event("meta", {**meta, "cached": False})
-        yield _sse_event("delta", {"text": summary})
-        yield _sse_event("done", {**meta, "cached": False})
-        return
-
-    prompt = _build_daily_summary_prompt(summary_items, language=request.language, day_label=target_date, topic=topic)
-    answer_client = OpenAIAnswerClient()
-    collected: list[str] = []
-    yield _sse_event("meta", {**meta, "cached": False})
-    try:
-        for chunk in answer_client.stream_answer(prompt=prompt, model=request.model):
-            if not chunk:
-                continue
-            collected.append(chunk)
-            yield _sse_event("delta", {"text": chunk})
-    except Exception as exc:
-        yield _sse_event("error", {"detail": str(exc)})
-        return
-
-    summary = "".join(collected).strip()
-    cache_path.write_text(_encode_summary_cache(summary, topic), encoding="utf-8")
-    yield _sse_event("done", {**meta, "cached": False})
-
-
-def _generate_today_summary(config: AppConfig, request: TodaySummaryRequest) -> dict[str, object]:
-    target_date = _resolve_target_date(request.target_date)
-    items, selection_mode, topic = _select_summary_papers(config, target_date, request.limit)
-    return _generate_today_summary_from_selection(
+    return _save_summary_text_impl(
         config,
-        request,
-        target_date=target_date,
-        items=items,
-        selection_mode=selection_mode,
-        topic=topic,
+        language=request.language,
+        target_date=request.target_date,
+        summary_text=request.summary_text,
     )
 
-
-def _ensure_today_ready(config: AppConfig, request: TodaySummaryRequest) -> dict[str, object]:
-    target_date = _resolve_target_date(request.target_date)
-    cache_path = _summary_cache_path(config, request.language, target_date)
-    items, selection_mode, topic = _select_summary_papers(config, target_date, request.limit)
-    actions: list[str] = []
-    imported_count = 0
-
-    if not items:
-        if target_date == datetime.now(TAIPEI_TZ).date().isoformat():
-            new_entries = ingest_feeds(config)
-        else:
-            new_entries = ingest_huggingface_daily_papers_for_date(config, target_date)
-        imported_count = len(new_entries)
-        actions.append("ingest")
-        items, selection_mode, topic = _select_summary_papers(config, target_date, request.limit)
-
-    needs_summary = request.force_refresh or not cache_path.exists() or bool(actions)
-    if needs_summary:
-        summary_result = _generate_today_summary_from_selection(
-            config,
-            TodaySummaryRequest(
-                language=request.language,
-                model=request.model,
-                limit=request.limit,
-                target_date=target_date,
-                force_refresh=True,
-            ),
-            target_date=target_date,
-            items=items,
-            selection_mode=selection_mode,
-            topic=topic,
-        )
-        actions.append("summarize")
-    else:
-        summary_result = _generate_today_summary_from_selection(
-            config,
-            request,
-            target_date=target_date,
-            items=items,
-            selection_mode=selection_mode,
-            topic=topic,
-        )
-        actions.append("load-cache")
-
-    summary_result["actions"] = actions
-    summary_result["imported_count"] = imported_count
-    return summary_result
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
 
 def create_app() -> FastAPI:
     app = FastAPI(title="Research Agent Web")
 
+    # Serve built frontend if it exists
+    frontend_dist = Path(__file__).parent.parent / "frontend" / "dist"
+    has_frontend = frontend_dist.exists()
+
+    @app.get("/legacy", response_class=HTMLResponse)
+    async def legacy_index():
+        legacy_file = frontend_dist / "legacy.html"
+        if has_frontend and legacy_file.exists():
+            return FileResponse(legacy_file)
+        return HTMLResponse(_render_app_html())
+
     @app.get("/", response_class=HTMLResponse)
-    async def index() -> str:
+    async def index():
+        if has_frontend:
+            legacy_file = frontend_dist / "legacy.html"
+            if legacy_file.exists():
+                return FileResponse(legacy_file)
+            return FileResponse(frontend_dist / "index.html")
         return _render_app_html()
+
+    if has_frontend:
+        # Mount assets folder explicitly if it exists
+        assets_dir = frontend_dist / "assets"
+        if assets_dir.exists():
+            app.mount("/assets", StaticFiles(directory=str(assets_dir)), name="assets")
+
+        legacy_html_path = frontend_dist / "legacy.html"
+        if legacy_html_path.exists():
+            @app.get("/legacy.html")
+            async def legacy_html() -> FileResponse:
+                return FileResponse(legacy_html_path)
+
+        favicon_path = frontend_dist / "favicon.svg"
+        if favicon_path.exists():
+            @app.get("/favicon.svg")
+            async def favicon() -> FileResponse:
+                return FileResponse(favicon_path)
+
+        icons_path = frontend_dist / "icons.svg"
+        if icons_path.exists():
+            @app.get("/icons.svg")
+            async def icons() -> FileResponse:
+                return FileResponse(icons_path)
 
     @app.get("/api/stats")
     async def api_stats() -> dict[str, object]:
