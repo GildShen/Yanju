@@ -47,6 +47,9 @@ EMPTY_MESSAGES = {
 }
 
 # ---------------------------------------------------------------------------
+# Data class placeholder ??mirrors TodaySummaryRequest from web.py
+# ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 # Data class placeholder – mirrors TodaySummaryRequest from web.py
 # ---------------------------------------------------------------------------
 
@@ -612,7 +615,7 @@ def preview_summary_selection_rewrite(config: AppConfig, *, language: str, model
     }
 
 
-def apply_summary_selection_rewrite(config: AppConfig, *, language: str, target_date: str | None, summary_text: str, start_offset: int, end_offset: int, selected_text: str, rewritten_text: str) -> dict[str, Any]:
+def apply_summary_selection_rewrite(config: AppConfig, *, language: str, target_date: str | None, starred_only: bool = False, summary_text: str, start_offset: int, end_offset: int, selected_text: str, rewritten_text: str) -> dict[str, Any]:
     resolved_date = resolve_target_date(target_date)
     text = summary_text or ""
     start, end, _ = resolve_summary_selection(text, start_offset, end_offset, selected_text)
@@ -622,7 +625,7 @@ def apply_summary_selection_rewrite(config: AppConfig, *, language: str, target_
 
     topic = get_research_topic(config)
     updated = text[:start] + rewritten + text[end:]
-    cache = summary_cache_path(config, language, resolved_date)
+    cache = summary_cache_path(config, language, resolved_date, starred_only)
     cache.write_text(encode_summary_cache(updated, topic), encoding="utf-8")
     return {
         "date": resolved_date,
@@ -634,13 +637,13 @@ def apply_summary_selection_rewrite(config: AppConfig, *, language: str, target_
     }
 
 
-def save_summary_text(config: AppConfig, *, language: str, target_date: str | None, summary_text: str) -> dict[str, Any]:
+def save_summary_text(config: AppConfig, *, language: str, target_date: str | None, starred_only: bool = False, summary_text: str) -> dict[str, Any]:
     resolved_date = resolve_target_date(target_date)
     text = (summary_text or "").strip()
     if not text:
         raise ValueError("Summary text is required.")
-    items, _, topic = select_summary_papers(config, resolved_date, 15)
-    cache = summary_cache_path(config, language, resolved_date)
+    items, _, topic = select_summary_papers(config, resolved_date, 15, starred_only)
+    cache = summary_cache_path(config, language, resolved_date, starred_only)
     cache.write_text(encode_summary_cache(text, topic), encoding="utf-8")
     return {
         "date": resolved_date,

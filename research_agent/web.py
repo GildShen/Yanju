@@ -119,6 +119,7 @@ class SummaryRewriteRequest(BaseModel):
     language: str = "zh-TW"
     model: str = DEFAULT_ANSWER_MODEL
     target_date: str | None = None
+    starred_only: bool = False
     summary_text: str
     start_offset: int
     end_offset: int
@@ -133,6 +134,7 @@ class SummaryRewriteApplyRequest(SummaryRewriteRequest):
 class SummarySaveRequest(BaseModel):
     language: str = "zh-TW"
     target_date: str | None = None
+    starred_only: bool = False
     summary_text: str
 
 class FeedsSaveRequest(BaseModel):
@@ -1697,6 +1699,7 @@ APP_HTML = r"""<!DOCTYPE html>
           body: JSON.stringify({
             language,
             target_date: targetDate,
+            starred_only: document.getElementById('summaryStarredOnly') ? document.getElementById('summaryStarredOnly').checked : false,
             summary_text: summaryText,
           }),
         });
@@ -1735,6 +1738,7 @@ APP_HTML = r"""<!DOCTYPE html>
             language,
             model: document.getElementById('answerModel').value || 'gpt-5-mini',
             target_date: targetDate,
+            starred_only: document.getElementById('summaryStarredOnly') ? document.getElementById('summaryStarredOnly').checked : false,
             summary_text: currentSummaryText,
             start_offset: currentSummarySelection.startOffset,
             end_offset: currentSummarySelection.endOffset,
@@ -1769,6 +1773,7 @@ APP_HTML = r"""<!DOCTYPE html>
             language,
             model: document.getElementById('answerModel').value || 'gpt-5-mini',
             target_date: targetDate,
+            starred_only: document.getElementById('summaryStarredOnly') ? document.getElementById('summaryStarredOnly').checked : false,
             summary_text: currentSummaryText,
             start_offset: currentSummaryRewritePreview.start_offset ?? currentSummarySelection.startOffset,
             end_offset: currentSummaryRewritePreview.end_offset ?? currentSummarySelection.endOffset,
@@ -2130,6 +2135,7 @@ def _preview_summary_selection_rewrite(config: AppConfig, request: SummaryRewrit
         language=request.language,
         model=request.model,
         target_date=request.target_date,
+        starred_only=request.starred_only,
         summary_text=request.summary_text,
         start_offset=request.start_offset,
         end_offset=request.end_offset,
@@ -2143,6 +2149,7 @@ def _apply_summary_selection_rewrite(config: AppConfig, request: SummaryRewriteA
         config,
         language=request.language,
         target_date=request.target_date,
+        starred_only=request.starred_only,
         summary_text=request.summary_text,
         start_offset=request.start_offset,
         end_offset=request.end_offset,
@@ -2156,6 +2163,7 @@ def _save_summary_text(config: AppConfig, request: SummarySaveRequest) -> dict[s
         config,
         language=request.language,
         target_date=request.target_date,
+        starred_only=request.starred_only,
         summary_text=request.summary_text,
     )
 
