@@ -134,6 +134,18 @@ class SummarySaveRequest(BaseModel):
     target_date: str | None = None
     summary_text: str
 
+class FeedsSaveRequest(BaseModel):
+    content: str
+
+import base64
+import hashlib
+class AnalyzeUploadRequest(BaseModel):
+    entry_id: str
+    filename: str
+    file_data: str
+    force: bool = True
+    model: str = DEFAULT_ANSWER_MODEL
+
 TAIPEI_TZ = timezone(timedelta(hours=8))
 LANGUAGE_LABELS = {
     "zh-TW": "Traditional Chinese",
@@ -149,7 +161,6 @@ EMPTY_MESSAGES = {
 
 
 
-@lru_cache(maxsize=1)
 def _load_ui_translations() -> dict[str, dict[str, str]]:
     path = Path(__file__).with_name("i18n") / "ui_translations.json"
     return json.loads(path.read_text(encoding="utf-8"))
@@ -836,6 +847,12 @@ APP_HTML = r"""<!DOCTYPE html>
               <label data-i18n="limit">Limit</label>
               <input id="paperLimit" value="20">
             </div>
+            <div>
+              <label data-i18n="journal">Journal</label>
+              <select id="paperJournal" onchange="filterAndRenderPapers()">
+                <option value="">ALL</option>
+              </select>
+            </div>
           </div>
           <div class="paper-search-row">
             <div>
@@ -850,6 +867,29 @@ APP_HTML = r"""<!DOCTYPE html>
           </div>
           <div class="list" id="paperList"></div>
           <div class="footer"><span data-i18n="server_command">Server command:</span> <span class="mono">python -m research_agent.web</span></div>
+        </section>
+
+        <section class="card" id="feeds-card">
+          <div class="card-head summary-head">
+            <div>
+              <h2 data-i18n="feeds_title">Feeds</h2>
+              <p data-i18n="feeds_desc">Manage your RSS/Atom feeds...</p>
+            </div>
+            <div class="summary-controls">
+              <button class="ghost" onclick="loadFeeds()" data-i18n="load_feeds">Load Feeds</button>
+            </div>
+          </div>
+          <div class="summary-box selectable" id="feedsOutput" ondblclick="enterFeedsEditMode()">Loading feeds...</div>
+          <div class="summary-editor" id="feedsEditor">
+            <textarea id="feedsEditorInput"></textarea>
+            <div class="actions">
+              <button onclick="saveFeedsEdit()" data-i18n="save_feeds">Save Feeds</button>
+              <button class="ghost" onclick="cancelFeedsEdit()" data-i18n="cancel">Cancel</button>
+            </div>
+          </div>
+          <div class="summary-actions">
+            <span class="summary-selection-status" id="feedsEditStatusLine"></span>
+          </div>
         </section>
       </aside>
     </section>
@@ -868,6 +908,11 @@ APP_HTML = r"""<!DOCTYPE html>
       <div class="row">
         <input id="analysisPdfUrlInput" data-i18n-placeholder="analysis_pdf_url_placeholder" placeholder="https://arxiv.org/pdf/2603.12345.pdf">
         <button class="ghost" id="analysisPdfUrlButton" onclick="analyzeWithPdfUrl()" data-i18n="analyze_with_pdf_url">Analyze with PDF URL</button>
+      </div>
+      <label for="analysisPdfFileInput" data-i18n="analysis_pdf_file">Upload PDF File</label>
+      <div class="row">
+        <input type="file" id="analysisPdfFileInput" accept="application/pdf">
+        <button class="ghost" id="analysisPdfFileButton" onclick="analyzeWithPdfFile()" data-i18n="analyze_with_pdf_file">Analyze with File</button>
       </div>
       <div id="analysisSnapshot"></div>
       <div id="analysisDisplay" ondblclick="beginAnalysisEdit()"></div>
@@ -1030,7 +1075,11 @@ APP_HTML = r"""<!DOCTYPE html>
     }
 
     function renderSummaryMetaLine({ date, language, paperCount, selectionMode, state, actions = [], topic = '', path = '' }) {
-      const parts = [date, language, t('paper_count_label', { count: paperCount }), summarySelectionModeLabel(selectionMode), summaryStateLabel(state)];
+      const parts = [date, language];
+      if (paperCount !== '' && paperCount !== null && paperCount !== undefined) {
+        parts.push(t('paper_count_label', { count: paperCount }));
+      }
+      parts.push(summarySelectionModeLabel(selectionMode), summaryStateLabel(state));
       if (actions.length) parts.push(t('actions_label', { actions: actions.join(', ') }));
       if (topic) parts.push(t('topic_label', { topic }));
       if (path) parts.push(path);
@@ -1145,6 +1194,18 @@ APP_HTML = r"""<!DOCTYPE html>
       document.getElementById('stats').innerHTML = stats.map(([label, value]) => `<div class="stat"><span>${label}</span><b>${value ?? 0}</b></div>`).join('');
     }
 
+    function renderStatsError(error) {
+      currentStatsData = null;
+      document.getElementById('stats').innerHTML = `<div class="stat"><span>${escapeHtml(t('stats_unavailable'))}</span><b>${escapeHtml(String(error.message || error))}</b></div>`;
+    }
+
+    function renderPaperDateError(error) {
+      const select = document.getElementById('paperDate');
+      select.innerHTML = `<option value="">${escapeHtml(t('dates_unavailable'))}</option>`;
+      select.value = '';
+      document.getElementById('paperList').innerHTML = `<div class="meta">${escapeHtml(String(error.message || error))}</div>`;
+    }
+
     function paperAbstractId(entryId) {
       return `paper-abstract-${entryId}`;
     }
@@ -1180,6 +1241,8 @@ APP_HTML = r"""<!DOCTYPE html>
       const exportButton = document.getElementById('analysisExportButton');
       const pdfUrlInput = document.getElementById('analysisPdfUrlInput');
       const pdfUrlButton = document.getElementById('analysisPdfUrlButton');
+      const pdfFileInput = document.getElementById('analysisPdfFileInput');
+      const pdfFileButton = document.getElementById('analysisPdfFileButton');
       const openObsidianButton = document.getElementById('analysisOpenObsidianButton');
       const saveButton = document.getElementById('analysisSaveButton');
       const cancelButton = document.getElementById('analysisCancelButton');
@@ -1188,6 +1251,8 @@ APP_HTML = r"""<!DOCTYPE html>
       if (exportButton) exportButton.disabled = isBusy;
       if (pdfUrlInput) pdfUrlInput.disabled = isBusy;
       if (pdfUrlButton) pdfUrlButton.disabled = isBusy;
+      if (pdfFileInput) pdfFileInput.disabled = isBusy;
+      if (pdfFileButton) pdfFileButton.disabled = isBusy;
       if (openObsidianButton) openObsidianButton.disabled = isBusy;
       if (saveButton) saveButton.disabled = isBusy;
       if (cancelButton) cancelButton.disabled = isBusy;
@@ -1249,6 +1314,8 @@ APP_HTML = r"""<!DOCTYPE html>
       setAnalysisStatus('');
       document.getElementById('analysisNoteMeta').textContent = '';
       document.getElementById('analysisPdfUrlInput').value = '';
+      const pdfFileInput = document.getElementById('analysisPdfFileInput');
+      if (pdfFileInput) pdfFileInput.value = '';
       document.getElementById('analysisOpenObsidianButton').hidden = true;
       document.getElementById('analysisTitle').textContent = '';
     }
@@ -1331,6 +1398,46 @@ APP_HTML = r"""<!DOCTYPE html>
       }
       setAnalysisStatus(t('analysis_running_pdf_url'));
       await openPaperAnalysis(currentAnalysisRecord.paper_entry_id, true, pdfUrl);
+    }
+
+    async function analyzeWithPdfFile() {
+      if (!currentAnalysisRecord || currentAnalysisLoading) return;
+      const fileInput = document.getElementById('analysisPdfFileInput');
+      if (!fileInput || !fileInput.files.length) {
+        alert(t('analysis_pdf_file_required'));
+        return;
+      }
+      const file = fileInput.files[0];
+      
+      setAnalysisStatus(t('analysis_running_pdf_file'));
+      setAnalysisBusyState(true);
+      
+      const reader = new FileReader();
+      reader.onload = async (e) => {
+        const base64Data = e.target.result.split(',')[1];
+        try {
+          const data = await api('/api/actions/analyze-paper/upload', {
+            method: 'POST',
+            body: JSON.stringify({
+              entry_id: currentAnalysisRecord.paper_entry_id || currentAnalysisRecord.entry_id || currentAnalysisRecord.id,
+              filename: file.name,
+              file_data: base64Data,
+              force: true
+            })
+          });
+          openAnalysisDialog(data);
+        } catch (error) {
+          alert(String(error.message || error));
+        } finally {
+          setAnalysisBusyState(false);
+          fileInput.value = '';
+        }
+      };
+      reader.onerror = () => {
+        alert("Failed to read file");
+        setAnalysisBusyState(false);
+      };
+      reader.readAsDataURL(file);
     }
 
     async function exportAnalysisNote() {
@@ -1443,15 +1550,25 @@ APP_HTML = r"""<!DOCTYPE html>
     }
 
     async function loadStats() {
-      renderStats(await api('/api/stats'));
+      try {
+        renderStats(await api('/api/stats'));
+      } catch (error) {
+        renderStatsError(error);
+        throw error;
+      }
     }
 
     async function loadPaperDates() {
-      const dates = await api('/api/paper-dates');
-      const select = document.getElementById('paperDate');
-      select.innerHTML = dates.map(date => `<option value="${date}">${date}</option>`).join('');
-      if (!select.value && dates.length) {
-        select.value = dates[0];
+      try {
+        const dates = await api('/api/paper-dates');
+        const select = document.getElementById('paperDate');
+        select.innerHTML = dates.map(date => `<option value="${date}">${date}</option>`).join('');
+        if (!select.value && dates.length) {
+          select.value = dates[0];
+        }
+      } catch (error) {
+        renderPaperDateError(error);
+        throw error;
       }
     }
 
@@ -1489,11 +1606,35 @@ APP_HTML = r"""<!DOCTYPE html>
       loadPapers();
     }
 
+    let currentPaperItems = [];
+
+    function updateJournalDropdown() {
+      const select = document.getElementById('paperJournal');
+      if (!select) return;
+      const currentSelection = select.value;
+      const sources = [...new Set(currentPaperItems.map(p => p.source).filter(Boolean))].sort();
+      select.innerHTML = '<option value="">ALL</option>' + sources.map(s => `<option value="${escapeHtml(s)}">${escapeHtml(s)}</option>`).join('');
+      if (sources.includes(currentSelection)) {
+        select.value = currentSelection;
+      } else {
+        select.value = '';
+      }
+    }
+
+    function filterAndRenderPapers() {
+      const select = document.getElementById('paperJournal');
+      const selectedJournal = select ? select.value : '';
+      const items = selectedJournal ? currentPaperItems.filter(p => p.source === selectedJournal) : currentPaperItems;
+      renderPapers(items);
+    }
+
     async function loadPapers() {
       const published = encodeURIComponent(document.getElementById('paperDate').value || '');
       const limit = encodeURIComponent(document.getElementById('paperLimit').value || '20');
       const text = encodeURIComponent(document.getElementById('paperSearch').value || '');
-      renderPapers(await api(`/api/papers?limit=${limit}&published=${published}&text=${text}`));
+      currentPaperItems = await api(`/api/papers?limit=${limit}&published=${published}&text=${text}`);
+      updateJournalDropdown();
+      filterAndRenderPapers();
     }
 
     function escapeHtml(value) {
@@ -1810,23 +1951,86 @@ APP_HTML = r"""<!DOCTYPE html>
         document.getElementById('topicStatus').dataset.topicValue = '';
       }
 
+      const statsPromise = loadStats();
+      const datesPromise = loadPaperDates();
+      const summaryPromise = ensureDailyReady();
+
       try {
-        await ensureDailyReady();
+        await summaryPromise;
       } catch (error) {
         document.getElementById('todaySummaryOutput').textContent = String(error.message || error);
       }
 
-      await Promise.allSettled([
-        loadPaperDates(),
-        loadStats(),
-      ]);
-
-      syncPaperDateFromSummary();
+      let datesLoaded = false;
+      try {
+        await datesPromise;
+        datesLoaded = true;
+        syncPaperDateFromSummary();
+      } catch (error) {
+        // renderPaperDateError already surfaced this failure
+      }
 
       try {
-        await loadPapers();
+        await statsPromise;
       } catch (error) {
-        document.getElementById('paperList').innerHTML = `<div class="meta">${escapeHtml(String(error.message || error))}</div>`;
+        // renderStatsError already surfaced this failure
+      }
+
+      if (datesLoaded) {
+        try {
+          await loadPapers();
+        } catch (error) {
+          document.getElementById('paperList').innerHTML = `<div class="meta">${escapeHtml(String(error.message || error))}</div>`;
+        }
+      }
+
+      await loadFeeds();
+    }
+
+    let currentFeedsText = '';
+    let isFeedsEditing = false;
+
+    function setFeedsEditing(editing) {
+      isFeedsEditing = editing;
+      document.getElementById('feedsOutput').classList.toggle('editing', editing);
+      document.getElementById('feedsEditor').classList.toggle('open', editing);
+    }
+
+    async function loadFeeds() {
+      try {
+        const data = await api('/api/feeds');
+        currentFeedsText = data.content;
+        document.getElementById('feedsOutput').textContent = currentFeedsText || t('feeds_empty', { default: 'No feeds configured yet.' });
+      } catch (error) {
+        document.getElementById('feedsOutput').textContent = String(error.message || error);
+      }
+    }
+
+    function enterFeedsEditMode() {
+      if (currentFeedsText === '' && document.getElementById('feedsOutput').textContent.includes('Error')) return;
+      setFeedsEditing(true);
+      document.getElementById('feedsEditorInput').value = currentFeedsText;
+      document.getElementById('feedsEditStatusLine').textContent = t('editing_feeds_status');
+      document.getElementById('feedsEditorInput').focus();
+    }
+
+    function cancelFeedsEdit() {
+      setFeedsEditing(false);
+      document.getElementById('feedsEditStatusLine').textContent = '';
+    }
+
+    async function saveFeedsEdit() {
+      const newText = document.getElementById('feedsEditorInput').value;
+      try {
+        await api('/api/feeds/save', {
+          method: 'POST',
+          body: JSON.stringify({ content: newText }),
+        });
+        currentFeedsText = newText;
+        document.getElementById('feedsOutput').textContent = currentFeedsText || 'No feeds configured yet.';
+        cancelFeedsEdit();
+      } catch (error) {
+        alert(String(error.message || error));
       }
     }
 
@@ -1895,6 +2099,11 @@ def _ensure_summary_embeddings(config: AppConfig, papers: list[dict[str, object]
     _embed_paper_records(config, missing_papers, model=model, dimensions=None, init_vec=False)
 
 
+@lru_cache(maxsize=64)
+def _cached_topic_embedding(topic: str, model: str) -> tuple[float, ...]:
+    return tuple(OpenAIEmbeddingClient().create_embeddings([topic], model=model).embeddings[0])
+
+
 def _resolve_target_date(target_date: str | None) -> str:
     if not target_date:
         return datetime.now(TAIPEI_TZ).date().isoformat()
@@ -1913,14 +2122,14 @@ def _papers_for_date(config: AppConfig, target_date: str, limit: int) -> list[di
 
 
 
-def _select_summary_papers(config: AppConfig, target_date: str, limit: int) -> tuple[list[dict[str, object]], str]:
+def _select_summary_papers(config: AppConfig, target_date: str, limit: int) -> tuple[list[dict[str, object]], str, str]:
     daily_items = _papers_for_date(config, target_date, 200)
     topic = _get_research_topic(config)
     if not topic:
-        return daily_items[:limit], "latest"
+        return daily_items[:limit], "latest", topic
 
     _ensure_summary_embeddings(config, daily_items, SUMMARY_FILTER_EMBEDDING_MODEL)
-    topic_embedding = OpenAIEmbeddingClient().create_embeddings([topic], model=SUMMARY_FILTER_EMBEDDING_MODEL).embeddings[0]
+    topic_embedding = list(_cached_topic_embedding(topic, SUMMARY_FILTER_EMBEDDING_MODEL))
     entry_ids = [str(item.get("entry_id")) for item in daily_items if item.get("entry_id")]
     with get_connection(config) as connection:
         initialize_database(connection)
@@ -1939,8 +2148,8 @@ def _select_summary_papers(config: AppConfig, target_date: str, limit: int) -> t
 
     scored.sort(key=lambda item: float(item.get("relevance_score", -999.0)), reverse=True)
     if scored:
-        return scored[:limit], "topic"
-    return daily_items[:limit], "latest"
+        return scored[:limit], "topic", topic
+    return daily_items[:limit], "latest", topic
 
 
 def _cosine_similarity(left: list[float], right: list[float]) -> float:
@@ -2030,7 +2239,7 @@ Only discuss papers that include a non-empty abstract in the provided input.
 Target style: research notes.
 - Write like a researcher organizing today's reading notes for later thinking and possible study design.
 - Start from a self-reflection (or murmuration) that makes this set of papers worth paying attention to.
-- Mention that you recently read several related papers and specify the source of papers.
+- Mention that you recently read some related papers and specify the source of papers. Specify the number of papers.
 - When discussing each paper, include the research problem, method, and main finding, but keep the prose flowing naturally.
 - Keep the tone rational, clear, and analytical, but not overly formal.
 - You may include a small amount of natural commentary, for example: this is interesting, to some extent, simply put.
@@ -2057,7 +2266,7 @@ Formatting rules:
 - The tone of the summary should be natural and conversational, not academic or formal.
 
 Suggested note flow:
-- Paragraph 1: why this cluster of papers matters now, and what thread connects them.
+- Paragraph 1: why this cluster of papers matters now, and what thread connects them. Begin with a short random murmuration of the papers.
 - Paragraphs 2-4: discuss representative papers as notes, each with problem, method, and finding.
 - Paragraph 5: synthesize patterns, contrast concepts, and end with a research-facing question or design idea.
 - Final section: `References` only limited to the papers used in this summary.
@@ -2200,10 +2409,10 @@ def _save_summary_text(config: AppConfig, request: SummarySaveRequest) -> dict[s
     summary_text = (request.summary_text or "").strip()
     if not summary_text:
         raise ValueError("Summary text is required.")
-    topic = _get_research_topic(config)
+    items, _, topic = _select_summary_papers(config, target_date, 15)
     cache_path = _summary_cache_path(config, request.language, target_date)
     cache_path.write_text(_encode_summary_cache(summary_text, topic), encoding="utf-8")
-    paper_count = len(_select_summary_papers(config, target_date, 15)[0])
+    paper_count = len(items)
     return {
         "date": target_date,
         "language": request.language,
@@ -2216,72 +2425,14 @@ def _save_summary_text(config: AppConfig, request: SummarySaveRequest) -> dict[s
     }
 
 
-def _stream_today_summary(config: AppConfig, request: TodaySummaryRequest):
-    target_date = _resolve_target_date(request.target_date)
-    items, selection_mode = _select_summary_papers(config, target_date, request.limit)
-    items = enrich_missing_abstracts(config, items)
-    summary_items = _summary_eligible_items(items)
-    topic = _get_research_topic(config)
-    cache_path = _summary_cache_path(config, request.language, target_date)
-    meta = {
-        "date": target_date,
-        "language": request.language,
-        "paper_count": len(summary_items),
-        "selection_mode": selection_mode,
-        "topic": topic,
-        "path": str(cache_path),
-    }
-
-    if cache_path.exists() and not request.force_refresh:
-        cached_topic, cached_summary, cached_prompt_version = _read_summary_cache(cache_path)
-        if cached_topic == topic and cached_prompt_version == SUMMARY_PROMPT_VERSION:
-            yield _sse_event("meta", {**meta, "cached": True})
-            yield _sse_event("delta", {"text": cached_summary})
-            yield _sse_event("done", {**meta, "cached": True})
-            return
-
-    if not summary_items:
-        summary = _summary_empty_message(request.language, had_items_without_abstract=bool(items))
-        cache_path.write_text(_encode_summary_cache(summary, topic), encoding="utf-8")
-        yield _sse_event("meta", {**meta, "cached": False})
-        yield _sse_event("delta", {"text": summary})
-        yield _sse_event("done", {**meta, "cached": False})
-        return
-
-    prompt = _build_daily_summary_prompt(summary_items, language=request.language, day_label=target_date, topic=topic)
-    answer_client = OpenAIAnswerClient()
-    collected: list[str] = []
-    yield _sse_event("meta", {**meta, "cached": False})
-    try:
-        for chunk in answer_client.stream_answer(prompt=prompt, model=request.model):
-            if not chunk:
-                continue
-            collected.append(chunk)
-            yield _sse_event("delta", {"text": chunk})
-    except Exception as exc:
-        yield _sse_event("error", {"detail": str(exc)})
-        return
-
-    summary = "".join(collected).strip()
-    cache_path.write_text(_encode_summary_cache(summary, topic), encoding="utf-8")
-    yield _sse_event("done", {**meta, "cached": False})
-
-
-def _generate_today_summary(config: AppConfig, request: TodaySummaryRequest) -> dict[str, object]:
-    target_date = _resolve_target_date(request.target_date)
-    items, selection_mode = _select_summary_papers(config, target_date, request.limit)
-    items = enrich_missing_abstracts(config, items)
-    summary_items = _summary_eligible_items(items)
-    topic = _get_research_topic(config)
-    cache_path = _summary_cache_path(config, request.language, target_date)
-
+def _cached_summary_response(*, request: TodaySummaryRequest, target_date: str, items: list[dict[str, object]], selection_mode: str, topic: str, cache_path: Path) -> dict[str, object] | None:
     if cache_path.exists() and not request.force_refresh:
         cached_topic, cached_summary, cached_prompt_version = _read_summary_cache(cache_path)
         if cached_topic == topic and cached_prompt_version == SUMMARY_PROMPT_VERSION:
             return {
                 "date": target_date,
                 "language": request.language,
-                "paper_count": len(summary_items),
+                "paper_count": len(items),
                 "summary": cached_summary,
                 "papers": [
                     {
@@ -2291,16 +2442,34 @@ def _generate_today_summary(config: AppConfig, request: TodaySummaryRequest) -> 
                         "published": item.get("published"),
                         "doi": item.get("doi"),
                     }
-                    for item in summary_items
+                    for item in items
                 ],
                 "cached": True,
                 "path": str(cache_path),
                 "selection_mode": selection_mode,
                 "topic": topic,
             }
+    return None
+
+
+def _generate_today_summary_from_selection(config: AppConfig, request: TodaySummaryRequest, *, target_date: str, items: list[dict[str, object]], selection_mode: str, topic: str) -> dict[str, object]:
+    cache_path = _summary_cache_path(config, request.language, target_date)
+    cached_response = _cached_summary_response(
+        request=request,
+        target_date=target_date,
+        items=items,
+        selection_mode=selection_mode,
+        topic=topic,
+        cache_path=cache_path,
+    )
+    if cached_response is not None:
+        return cached_response
+
+    enriched_items = enrich_missing_abstracts(config, items)
+    summary_items = _summary_eligible_items(enriched_items)
 
     if not summary_items:
-        summary = _summary_empty_message(request.language, had_items_without_abstract=bool(items))
+        summary = _summary_empty_message(request.language, had_items_without_abstract=bool(enriched_items))
         cache_path.write_text(_encode_summary_cache(summary, topic), encoding="utf-8")
         return {
             "date": target_date,
@@ -2339,25 +2508,96 @@ def _generate_today_summary(config: AppConfig, request: TodaySummaryRequest) -> 
     }
 
 
+def _stream_today_summary(config: AppConfig, request: TodaySummaryRequest):
+    target_date = _resolve_target_date(request.target_date)
+    items, selection_mode, topic = _select_summary_papers(config, target_date, request.limit)
+    cache_path = _summary_cache_path(config, request.language, target_date)
+
+    cached_response = _cached_summary_response(
+        request=request,
+        target_date=target_date,
+        items=items,
+        selection_mode=selection_mode,
+        topic=topic,
+        cache_path=cache_path,
+    )
+    if cached_response is not None:
+        meta = {k: cached_response[k] for k in ["date", "language", "paper_count", "selection_mode", "topic", "path"]}
+        yield _sse_event("meta", {**meta, "cached": True})
+        yield _sse_event("delta", {"text": str(cached_response["summary"])})
+        yield _sse_event("done", {**meta, "cached": True})
+        return
+
+    enriched_items = enrich_missing_abstracts(config, items)
+    summary_items = _summary_eligible_items(enriched_items)
+    meta = {
+        "date": target_date,
+        "language": request.language,
+        "paper_count": len(summary_items),
+        "selection_mode": selection_mode,
+        "topic": topic,
+        "path": str(cache_path),
+    }
+
+    if not summary_items:
+        summary = _summary_empty_message(request.language, had_items_without_abstract=bool(enriched_items))
+        cache_path.write_text(_encode_summary_cache(summary, topic), encoding="utf-8")
+        yield _sse_event("meta", {**meta, "cached": False})
+        yield _sse_event("delta", {"text": summary})
+        yield _sse_event("done", {**meta, "cached": False})
+        return
+
+    prompt = _build_daily_summary_prompt(summary_items, language=request.language, day_label=target_date, topic=topic)
+    answer_client = OpenAIAnswerClient()
+    collected: list[str] = []
+    yield _sse_event("meta", {**meta, "cached": False})
+    try:
+        for chunk in answer_client.stream_answer(prompt=prompt, model=request.model):
+            if not chunk:
+                continue
+            collected.append(chunk)
+            yield _sse_event("delta", {"text": chunk})
+    except Exception as exc:
+        yield _sse_event("error", {"detail": str(exc)})
+        return
+
+    summary = "".join(collected).strip()
+    cache_path.write_text(_encode_summary_cache(summary, topic), encoding="utf-8")
+    yield _sse_event("done", {**meta, "cached": False})
+
+
+def _generate_today_summary(config: AppConfig, request: TodaySummaryRequest) -> dict[str, object]:
+    target_date = _resolve_target_date(request.target_date)
+    items, selection_mode, topic = _select_summary_papers(config, target_date, request.limit)
+    return _generate_today_summary_from_selection(
+        config,
+        request,
+        target_date=target_date,
+        items=items,
+        selection_mode=selection_mode,
+        topic=topic,
+    )
+
+
 def _ensure_today_ready(config: AppConfig, request: TodaySummaryRequest) -> dict[str, object]:
     target_date = _resolve_target_date(request.target_date)
     cache_path = _summary_cache_path(config, request.language, target_date)
-    papers, _ = _select_summary_papers(config, target_date, request.limit)
+    items, selection_mode, topic = _select_summary_papers(config, target_date, request.limit)
     actions: list[str] = []
     imported_count = 0
 
-    if not papers:
+    if not items:
         if target_date == datetime.now(TAIPEI_TZ).date().isoformat():
             new_entries = ingest_feeds(config)
         else:
             new_entries = ingest_huggingface_daily_papers_for_date(config, target_date)
         imported_count = len(new_entries)
         actions.append("ingest")
-        papers, _ = _select_summary_papers(config, target_date, request.limit)
+        items, selection_mode, topic = _select_summary_papers(config, target_date, request.limit)
 
     needs_summary = request.force_refresh or not cache_path.exists() or bool(actions)
     if needs_summary:
-        summary_result = _generate_today_summary(
+        summary_result = _generate_today_summary_from_selection(
             config,
             TodaySummaryRequest(
                 language=request.language,
@@ -2366,10 +2606,21 @@ def _ensure_today_ready(config: AppConfig, request: TodaySummaryRequest) -> dict
                 target_date=target_date,
                 force_refresh=True,
             ),
+            target_date=target_date,
+            items=items,
+            selection_mode=selection_mode,
+            topic=topic,
         )
         actions.append("summarize")
     else:
-        summary_result = _generate_today_summary(config, request)
+        summary_result = _generate_today_summary_from_selection(
+            config,
+            request,
+            target_date=target_date,
+            items=items,
+            selection_mode=selection_mode,
+            topic=topic,
+        )
         actions.append("load-cache")
 
     summary_result["actions"] = actions
@@ -2421,6 +2672,24 @@ def create_app() -> FastAPI:
         config = make_config()
         topic = await run_in_threadpool(_set_research_topic, config, request.topic)
         return {"topic": topic}
+
+    @app.get("/api/feeds")
+    async def api_get_feeds() -> dict[str, str]:
+        config = make_config()
+        def _read() -> str:
+            if not config.feeds_path.exists():
+                return ""
+            return config.feeds_path.read_text(encoding="utf-8")
+        content = await run_in_threadpool(_read)
+        return {"content": content}
+
+    @app.post("/api/feeds/save")
+    async def api_save_feeds(request: FeedsSaveRequest) -> dict[str, str]:
+        config = make_config()
+        def _write() -> None:
+            config.feeds_path.write_text(request.content, encoding="utf-8")
+        await run_in_threadpool(_write)
+        return {"status": "ok"}
 
     @app.post("/api/actions/ingest")
     async def api_ingest() -> dict[str, object]:
@@ -2496,13 +2765,46 @@ def create_app() -> FastAPI:
         except Exception as exc:
             raise HTTPException(status_code=500, detail=str(exc)) from exc
 
+    @app.post("/api/actions/analyze-paper/upload")
+    async def api_analyze_paper_upload(request: AnalyzeUploadRequest) -> dict[str, object]:
+        config = make_config()
+        def _process() -> dict[str, object]:
+            from research_agent.db import upsert_pdf_catalog_entry
+            pdf_bytes = base64.b64decode(request.file_data)
+            config.default_pdf_dir.mkdir(parents=True, exist_ok=True)
+            pdf_path = config.default_pdf_dir / f"{request.entry_id}_{request.filename}"
+            pdf_path.write_bytes(pdf_bytes)
+            file_hash = hashlib.sha256(pdf_bytes).hexdigest()
+            with get_connection(config) as connection:
+                initialize_database(connection)
+                upsert_pdf_catalog_entry(
+                    connection,
+                    file_path=str(pdf_path.resolve()),
+                    file_name=request.filename,
+                    file_hash=file_hash,
+                    title_extracted="",
+                    title_matched="Manual Upload",
+                    match_confidence=1.0,
+                    catalog_status="manual_upload",
+                    paper_entry_id=request.entry_id,
+                    notes="Uploaded by user via web UI",
+                    updated_at=datetime.now(timezone.utc).isoformat()
+                )
+            result = analyze_paper_methodology(config, request.entry_id, model=request.model, force=request.force)
+            return _attach_analysis_note_metadata(config, result)
+            
+        try:
+            return await run_in_threadpool(_process)
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+
     @app.post("/api/actions/analyze-paper/save")
     async def api_save_paper_analysis(request: PaperAnalysisSaveRequest) -> dict[str, object]:
         config = make_config()
         def _save_analysis() -> dict[str, object]:
             with get_connection(config) as connection:
                 initialize_database(connection)
-                updated = update_methodology_run_text(connection, request.run_id, request.analysis_text, datetime.now(UTC).isoformat())
+                updated = update_methodology_run_text(connection, request.run_id, request.analysis_text, datetime.now(timezone.utc).isoformat())
                 if updated is None:
                     raise ValueError(f"Methodology run not found: {request.run_id}")
                 return updated

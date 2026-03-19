@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import re
 from datetime import UTC, datetime
@@ -21,6 +21,7 @@ from .db import (
     save_methodology_run,
     update_methodology_run_note_path,
     update_paper_metadata,
+    update_paper_abstract,
 )
 from .openai_client import DEFAULT_ANSWER_MODEL, OpenAIAnswerClient
 
@@ -150,6 +151,7 @@ If a field is not clear from the paper main body, explicitly say \"Not clear fro
 Write in Traditional Chinese.
 Return clean markdown with exactly these sections and no others:
 
+## Abstract
 ## Research Problem
 ## Theory And Context
 ## Data And Sample
@@ -305,15 +307,20 @@ def analyze_paper_methodology(config: AppConfig, entry_id: str, *, model: str = 
     if override_url:
         paper["pdf_url"] = override_url
 
+    extracted_abstract = ""
     pages, source_type, source_ref = _resolve_source_pages(config, paper)
     if not pages:
-        analysis_text = "## Research Problem\nNot clear from the main body.\n\n## Theory And Context\nNot clear from the main body.\n\n## Data And Sample\nNot clear from the main body.\n\n## Research Design\nNot clear from the main body.\n\n## Measures And Constructs\nNot clear from the main body.\n\n## Analysis Method\nNot clear from the main body.\n\n## Main Findings\nNot clear from the main body.\n\n## Limitations\nNot clear from the main body.\n\n## Notes For Future Research\nPDF full text was not available, so this analysis could not inspect the main body."
+        analysis_text = "## Abstract\nNot clear from the main body.\n\n## Research Problem\nNot clear from the main body.\n\n## Theory And Context\nNot clear from the main body.\n\n## Data And Sample\nNot clear from the main body.\n\n## Research Design\nNot clear from the main body.\n\n## Measures And Constructs\nNot clear from the main body.\n\n## Analysis Method\nNot clear from the main body.\n\n## Main Findings\nNot clear from the main body.\n\n## Limitations\nNot clear from the main body.\n\n## Notes For Future Research\nPDF full text was not available, so this analysis could not inspect the main body."
         status = "no_source"
     else:
         prompt = _build_analysis_prompt(paper, pages)
         response = OpenAIAnswerClient().create_answer(prompt=prompt, model=model)
         analysis_text = response.text.strip()
         status = "completed"
+
+        abstract_match = re.search(r"##\s+Abstract\s*\n(.*?)(?=\n## |\Z)", analysis_text, re.DOTALL | re.IGNORECASE)
+        if abstract_match:
+            extracted_abstract = abstract_match.group(1).strip()
 
     now = datetime.now(UTC).isoformat()
     payload = {
@@ -335,6 +342,8 @@ def analyze_paper_methodology(config: AppConfig, entry_id: str, *, model: str = 
         initialize_database(connection)
         if override_url and status == "completed" and source_type == "remote_pdf" and source_ref == override_url:
             update_paper_metadata(connection, entry_id, pdf_url=override_url)
+        if status == "completed" and extracted_abstract:
+            update_paper_abstract(connection, entry_id, extracted_abstract)
         run_id = save_methodology_run(connection, payload)
         latest = fetch_latest_methodology_run(connection, entry_id, prompt_version=PROMPT_VERSION, model=model)
     result = dict(latest) if latest else payload

@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import json
 import math
@@ -6,6 +6,9 @@ import sqlite3
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from typing import Any, Iterator
+
+
+_SQLITE_VEC_LOAD_STATE: dict[int, bool] = {}
 
 from .config import AppConfig
 from .models import PaperEntry
@@ -230,7 +233,7 @@ def insert_paper(connection: sqlite3.Connection, paper: PaperEntry, feed_url: st
     )
     for index, author_name in enumerate(paper.authors):
         author_id = _ensure_author(connection, author_name)
-        connection.execute("INSERT INTO paper_authors (paper_entry_id, author_id, author_order) VALUES (?, ?, ?)", (paper.entry_id, author_id, index))
+        connection.execute("INSERT OR IGNORE INTO paper_authors (paper_entry_id, author_id, author_order) VALUES (?, ?, ?)", (paper.entry_id, author_id, index))
 
 
 def update_paper_metadata(connection: sqlite3.Connection, entry_id: str, doi: str | None = None, pdf_url: str | None = None, ai_summary: str | None = None, tags: list[str] | None = None) -> None:
@@ -485,9 +488,14 @@ def get_setting(connection: sqlite3.Connection, key: str) -> str | None:
 
 
 def try_load_sqlite_vec(connection: sqlite3.Connection) -> bool:
+    connection_key = id(connection)
+    cached = _SQLITE_VEC_LOAD_STATE.get(connection_key)
+    if cached is not None:
+        return cached
     try:
         import sqlite_vec  # type: ignore
     except ImportError:
+        _SQLITE_VEC_LOAD_STATE[connection_key] = False
         return False
     try:
         connection.enable_load_extension(True)
@@ -496,10 +504,13 @@ def try_load_sqlite_vec(connection: sqlite3.Connection) -> bool:
         elif hasattr(sqlite_vec, "loadable_path"):
             connection.load_extension(sqlite_vec.loadable_path())
         else:
+            _SQLITE_VEC_LOAD_STATE[connection_key] = False
             return False
         connection.enable_load_extension(False)
+        _SQLITE_VEC_LOAD_STATE[connection_key] = True
         return True
     except Exception:
+        _SQLITE_VEC_LOAD_STATE[connection_key] = False
         return False
 
 
